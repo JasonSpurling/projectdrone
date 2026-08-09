@@ -1,0 +1,1564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Data Flight</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<!-- Vendored locally (not loaded from unpkg.com) so the dashboard itself
+     loads on a genuinely air-gapped box -- map tile imagery and live data
+     feeds are still necessarily internet-dependent (that's inherent to
+     what they are), but the application code shouldn't be. -->
+<link href="/static/vendor/maplibre-gl.css" rel="stylesheet" />
+<script src="/static/vendor/maplibre-gl.js"></script>
+<script src="/static/vendor/lucide.js"></script>
+<style>
+  :root {
+    --bg: #0a0d12;
+    --panel: #12161d;
+    --panel-2: #171c24;
+    --border: #232a35;
+    --text: #dbe3ee;
+    --muted: #7c8a9c;
+    --accent: #4c8dff;
+    --online: #3ddc84;
+    --offline: #ff4d4f;
+    --confirmed: #ff4d4f;
+    --likely: #ff9f40;
+    --possible: #ffd93d;
+    --unclassified: #6c7a89;
+    --zone: #ff4d4f;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
+
+  #app { display: grid; grid-template-rows: 52px 1fr; height: 100vh; }
+
+  #header { display: flex; align-items: center; padding: 0 16px; background: var(--panel);
+    border-bottom: 1px solid var(--border); gap: 20px; z-index: 20; }
+  #brand { font-weight: 700; font-size: 15px; letter-spacing: 0.04em; display: flex; align-items: center; gap: 8px; }
+  #brand .mark { width: 20px; height: 20px; border-radius: 5px;
+    background: linear-gradient(135deg, var(--accent), #7fb2ff); display:inline-block; }
+  #header .spacer { flex: 1; }
+  .status-chip { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted);
+    padding: 4px 10px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--online); }
+  .status-dot.offline { background: var(--offline); }
+  #clock { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--text); min-width: 130px; text-align: right; }
+
+  #body { display: grid; grid-template-columns: 64px 1fr; height: 100%; overflow: hidden; }
+
+  #nav { background: var(--panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; align-items: center; padding-top: 10px; gap: 4px; }
+  .nav-item { width: 48px; height: 48px; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 3px; border-radius: 8px; cursor: pointer; color: var(--muted);
+    font-size: 9px; letter-spacing: 0.02em; }
+  .nav-item svg { width: 19px; height: 19px; }
+  .nav-item:hover { background: var(--panel-2); color: var(--text); }
+  .nav-item.active { background: rgba(76,141,255,0.14); color: var(--accent); }
+
+  #main { display: grid; grid-template-rows: 1fr 260px; height: 100%; overflow: hidden; position: relative; }
+  #map { width: 100%; height: 100%; }
+
+  #map-controls { position: absolute; top: 12px; right: 12px; display: flex; flex-direction: column;
+    gap: 6px; z-index: 10; }
+
+  .hidden { display: none !important; }
+  #history-controls { position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 10; background: rgba(18,22,29,0.92); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 12px; display: flex; align-items: center; gap: 10px; backdrop-filter: blur(6px);
+    min-width: 420px; }
+  #history-controls input[type=range] { flex: 1; accent-color: var(--accent); }
+  #history-time-label { font-size: 11px; color: var(--muted); white-space: nowrap; min-width: 128px; text-align: right; }
+  .ctrl-group { background: rgba(18,22,29,0.92); border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px; display: flex; gap: 4px; backdrop-filter: blur(6px); }
+  .ctrl-group.vertical { flex-direction: column; }
+  .ctrl-btn { background: transparent; border: 1px solid transparent; color: var(--muted);
+    font-size: 11px; padding: 6px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+    display: flex; align-items: center; gap: 6px; }
+  .ctrl-btn:hover { background: var(--panel-2); color: var(--text); }
+  .ctrl-btn svg { width: 13px; height: 13px; flex-shrink: 0; }
+  .ctrl-btn.active { background: rgba(76,141,255,0.16); color: var(--accent); border-color: rgba(76,141,255,0.3); }
+  .ctrl-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .ctrl-dot.on { background: var(--accent); }
+  .ctrl-label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 2px 6px 4px; }
+
+  #bottom { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--border);
+    background: var(--panel); overflow: hidden; }
+  #bottom-left, #bottom-right { overflow-y: auto; padding: 10px 12px; border-right: 1px solid var(--border); }
+  #bottom-right { border-right: none; }
+
+  .panel-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);
+    margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+
+  #search-box { width: 100%; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 10px; color: var(--text); font-size: 12.5px; margin-bottom: 8px; }
+  #search-box:focus { outline: none; border-color: var(--accent); }
+
+  .list-row { background: var(--panel-2); border: 1px solid var(--border); border-left: 3px solid var(--muted);
+    border-radius: 6px; padding: 9px 10px; margin-bottom: 6px; cursor: pointer; font-size: 12.5px; }
+  .list-row:hover { border-color: var(--accent); }
+  .list-row.confirmed_drone, .list-row.high { border-left-color: var(--confirmed); }
+  .list-row.likely_drone { border-left-color: var(--likely); }
+  .list-row.possible_drone { border-left-color: var(--possible); }
+  .list-row .row-top { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 3px; }
+  .list-row .row-sub { color: var(--muted); font-size: 11px; }
+
+  #detail-empty { color: var(--muted); font-size: 12.5px; text-align: center; padding: 30px 10px; }
+  .kv { display: grid; grid-template-columns: 100px 1fr; gap: 3px 8px; font-size: 12px; margin: 8px 0; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  .badge { display: inline-block; padding: 2px 7px; border-radius: 3px; font-size: 10px;
+    background: var(--panel-2); border: 1px solid var(--border); margin-right: 4px; margin-top: 4px; }
+  .section-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; margin-bottom: 8px; }
+
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #2a3340; border-radius: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="header">
+    <div id="brand"><span class="mark"></span>DATA FLIGHT</div>
+    <div class="spacer"></div>
+    <div class="status-chip"><span class="status-dot" id="conn-dot"></span><span id="conn-text">Connecting…</span></div>
+    <div class="status-chip"><span id="track-count">0</span>&nbsp;active tracks</div>
+    <div class="status-chip"><span id="plane-count">0</span>&nbsp;aircraft</div>
+    <div id="clock">--:--:--</div>
+  </div>
+
+  <div id="body">
+    <div id="nav">
+      <div class="nav-item active" data-mode="live" title="Live"><i data-lucide="radar"></i>Live</div>
+      <div class="nav-item" data-mode="history" title="History"><i data-lucide="history"></i>History</div>
+      <div class="nav-item" data-mode="alerts" title="Alerts"><i data-lucide="triangle-alert"></i>Alerts</div>
+      <div class="nav-item" data-mode="zones" title="Zones"><i data-lucide="shield-alert"></i>Zones</div>
+      <div class="nav-item" data-mode="registry" title="Registry"><i data-lucide="book-open"></i>Registry</div>
+      <div class="nav-item" data-mode="settings" title="Settings"><i data-lucide="settings"></i>Settings</div>
+    </div>
+
+    <div id="main">
+      <div id="map"></div>
+
+      <div id="history-controls" class="hidden">
+        <div class="ctrl-group">
+          <button class="ctrl-btn" data-range="3600">1h</button>
+          <button class="ctrl-btn" data-range="21600">6h</button>
+          <button class="ctrl-btn" data-range="86400">24h</button>
+          <button class="ctrl-btn" data-range="604800">7d</button>
+        </div>
+        <button class="ctrl-btn" id="history-play" title="Play/pause replay"><i data-lucide="play"></i></button>
+        <input type="range" id="history-scrub" min="0" max="1000" value="1000" />
+        <span id="history-time-label">--</span>
+      </div>
+
+      <div id="map-controls">
+        <div class="ctrl-group">
+          <button class="ctrl-btn active" id="btn-2d"><i data-lucide="square"></i>2D</button>
+          <button class="ctrl-btn" id="btn-3d"><i data-lucide="globe"></i>3D</button>
+        </div>
+        <div class="ctrl-group">
+          <button class="ctrl-btn" id="btn-terrain"><i data-lucide="mountain"></i><span class="ctrl-dot" id="dot-terrain"></span>Terrain</button>
+        </div>
+        <div class="ctrl-group">
+          <button class="ctrl-btn active" id="btn-satellite"><i data-lucide="satellite"></i>Satellite</button>
+          <button class="ctrl-btn" id="btn-road"><i data-lucide="map"></i>Road</button>
+        </div>
+        <div class="ctrl-group vertical">
+          <div class="ctrl-label">Tracks</div>
+          <button class="ctrl-btn active" id="toggle-aircraft"><i data-lucide="plane"></i><span class="ctrl-dot on" id="dot-aircraft"></span>Aircraft</button>
+          <button class="ctrl-btn active" id="toggle-helicopter" title="Uses OpenSky's real ADS-B category when the aircraft reports one; falls back to a low-altitude + low-speed heuristic only when it doesn't.">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v4M4 7h16M9 7v3a3 3 0 003 3 3 3 0 003-3V7M6 21h12M12 13v8M8 17h8"/></svg>
+            <span class="ctrl-dot on" id="dot-helicopter"></span>Helicopter*
+          </button>
+          <button class="ctrl-btn active" id="toggle-drone"><i data-lucide="drone"></i><span class="ctrl-dot on" id="dot-drone"></span>Drone</button>
+          <button class="ctrl-btn active" id="toggle-airports"><i data-lucide="tower-control"></i><span class="ctrl-dot on" id="dot-airports"></span>Airports</button>
+        </div>
+      </div>
+
+      <div id="bottom">
+        <div id="bottom-left">
+          <div class="panel-title"><span id="list-title">Live Tracks</span><span id="list-count">0</span></div>
+          <input id="search-box" placeholder="Search tracks, callsigns, zones…" />
+          <div id="list-content"></div>
+        </div>
+        <div id="bottom-right">
+          <div class="panel-title"><span id="detail-title">Selection</span></div>
+          <div id="detail-content"><div id="detail-empty">Select an item on the left, or click something on the map.</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==================== State ====================
+const CLASSIFICATION_COLOR_EXPR = ['match', ['get', 'classification'],
+  'confirmed_drone', '#ff4d4f', 'likely_drone', '#ff9f40', 'possible_drone', '#ffd93d',
+  'aircraft', '#4c8dff', 'helicopter', '#38c9c9', '#6c7a89'];
+
+let mode = 'live';
+let selectedId = null;
+let lastFlyTarget = null; // "type:id" of whatever the map last auto-flew to -- prevents re-centering on every re-render
+// Flat 2D is the primary/default view per the design spec -- 3D globe is
+// an optional toggle, not the default.
+let use3D = false;
+let terrainOn = false;
+let basemap = 'satellite';
+let showAircraft = true, showHelicopter = true, showDrone = true, showAirports = true;
+let apiOk = true;
+
+let tracksData = [];
+let aircraftData = [];
+let aircraftFetchedAt = 0;
+let sourceLastPoll = {}; // per-source last_poll (ms) -- see tick()'s comment on why this can't be a single shared timestamp
+// Dead reckoning between polls is never perfect -- a turn, a speed change,
+// or a momentary null in velocity/heading data all mean the real position
+// that lands every ~12s can be behind where the guess had the plane,
+// which reads as a backward jump when applied instantly. Easing each
+// render frame toward the target instead of snapping to it smooths that
+// correction out, whichever direction it goes.
+const lastRenderedPos = new Map(); // icao24 -> [lon, lat]
+let incidentsData = [];
+let zonesData = [];
+let airspaceData = { faa_uas_facility_map: [], faa_national_security_restrictions: [], faa_tfr: [], openaip_restrictions: [] };
+let airportsData = [];
+let runwaysData = []; // flat list across all airports; filtered by airport_ident when drawing an outline
+
+// Historical replay (History tab)
+let historyWindow = null;       // {start, end, tracks, incidents} from /api/history/window
+let historyScrubMs = 0;         // current playhead, absolute epoch ms within [start*1000, end*1000]
+let historyPlaying = false;
+let historyPlayTimer = null;
+const HISTORY_PLAYBACK_SPEED = 60; // 1 real second advances the playhead by this many seconds
+
+// ==================== Map setup ====================
+const TERRAIN_SOURCE = {
+  type: 'raster-dem',
+  tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+  tileSize: 256,
+  encoding: 'terrarium',
+};
+const SATELLITE_SOURCE = {
+  type: 'raster',
+  tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+  tileSize: 256,
+  attribution: 'Tiles &copy; Esri',
+};
+const ROAD_SOURCE = {
+  type: 'raster',
+  tiles: ['https://a.tile.openstreetmap.org/{z}/{x}/{y}.png'],
+  tileSize: 256,
+  attribution: '&copy; OpenStreetMap contributors',
+};
+
+function baseStyle() {
+  return {
+    version: 8,
+    sources: {
+      basemap: basemap === 'satellite' ? SATELLITE_SOURCE : ROAD_SOURCE,
+      terrainSource: TERRAIN_SOURCE,
+    },
+    layers: [
+      { id: 'space-bg', type: 'background', paint: { 'background-color': '#000000' } },
+      { id: 'basemap', type: 'raster', source: 'basemap' },
+    ],
+    terrain: terrainOn ? { source: 'terrainSource', exaggeration: 1.4 } : undefined,
+    projection: { type: use3D ? 'globe' : 'mercator' },
+    sky: {
+      'sky-color': '#000000',
+      'sky-horizon-blend': 0.55,
+      'horizon-color': '#0d1b2e',
+      'horizon-fog-blend': 0.6,
+      'fog-color': '#0a1526',
+      'fog-ground-blend': 0.7,
+    },
+  };
+}
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: baseStyle(),
+  center: [10, 20],
+  zoom: 1.4,
+  pitch: 0,
+  attributionControl: { compact: true },
+});
+map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
+if (maplibregl.GlobeControl) {
+  map.addControl(new maplibregl.GlobeControl(), 'bottom-right');
+} else {
+  console.warn('This MapLibre GL JS build has no GlobeControl -- globe projection may not be supported.');
+}
+
+// SVG silhouettes -- colors baked directly into the fill.
+const PLANE_ICON_SVG = `
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+    <path fill="#4c8dff" stroke="#0a0d12" stroke-width="0.6"
+      d="M12 1.5l1.6 1.6v6.2l7.4 4.3v2l-7.4-2.1v4.9l2.4 1.8v1.7L12 20.7l-3.9 1.2v-1.7l2.4-1.8v-4.9l-7.4 2.1v-2l7.4-4.3V3.1z"/>
+  </svg>`;
+const HELI_ICON_SVG = `
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+    <path fill="#38c9c9" stroke="#0a0d12" stroke-width="0.6"
+      d="M2 4h20v1.4H2zM11 5.4h2v3.2h-2z
+         M7 8.6h10a4 4 0 014 4v1.4H3v-1.4a4 4 0 014-4z
+         M11.2 14h1.6v6.6h-1.6z
+         M8 20h8v1.4H8z"/>
+  </svg>`;
+
+function loadSvgIcon(map, id, svgString) {
+  return new Promise((resolve) => {
+    const img = new Image(32, 32);
+    img.onload = () => { if (!map.hasImage(id)) map.addImage(id, img); resolve(); };
+    img.onerror = () => resolve();
+    img.src = 'data:image/svg+xml;base64,' + btoa(svgString);
+  });
+}
+
+map.on('load', async () => {
+  // Explicit call is the reliable way to activate globe mode -- relying on
+  // the style-JSON projection property alone was not enough.
+  try {
+    map.setProjection({ type: use3D ? 'globe' : 'mercator' });
+  } catch (e) {
+    console.error('setProjection failed:', e);
+  }
+
+  await Promise.all([
+    loadSvgIcon(map, 'plane-icon', PLANE_ICON_SVG),
+    loadSvgIcon(map, 'heli-icon', HELI_ICON_SVG),
+  ]);
+
+  map.addSource('aircraft', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'aircraft-layer', type: 'symbol', source: 'aircraft',
+    layout: {
+      'icon-image': ['get', 'icon'], 'icon-size': 0.85,
+      'icon-rotate': ['get', 'heading'], 'icon-rotation-alignment': 'map',
+      'icon-allow-overlap': true, 'icon-ignore-placement': true,
+    },
+  });
+
+  map.addSource('drones', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'drones-layer', type: 'circle', source: 'drones',
+    paint: {
+      'circle-radius': ['+', 6, ['*', 8, ['get', 'confidence']]],
+      'circle-color': CLASSIFICATION_COLOR_EXPR,
+      'circle-stroke-width': 2, 'circle-stroke-color': '#0a0d12',
+    },
+  });
+
+  // Historical replay layers (History tab) -- a trail line per track plus
+  // a point at the track's interpolated position for the current scrub
+  // time. Kept separate from the live 'drones' source/layer rather than
+  // reusing it, so live and replay rendering can't stomp on each other.
+  map.addSource('history-trails', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'history-trails-layer', type: 'line', source: 'history-trails',
+    paint: { 'line-color': CLASSIFICATION_COLOR_EXPR, 'line-width': 2, 'line-opacity': 0.55 },
+  });
+  map.addSource('history-tracks', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'history-tracks-layer', type: 'circle', source: 'history-tracks',
+    paint: {
+      'circle-radius': 7, 'circle-color': CLASSIFICATION_COLOR_EXPR,
+      'circle-stroke-width': 2, 'circle-stroke-color': '#0a0d12',
+    },
+  });
+  map.addSource('history-incidents', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'history-incidents-layer', type: 'circle', source: 'history-incidents',
+    paint: {
+      'circle-radius': 5, 'circle-color': '#ff2d2d', 'circle-opacity': 0.85,
+      'circle-stroke-width': 1.5, 'circle-stroke-color': '#0a0d12',
+    },
+  });
+
+  map.addSource('zones', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'zones-fill', type: 'fill', source: 'zones',
+    paint: { 'fill-color': ['case', ['==', ['get', 'kind'], 'no_fly'], '#ff4d4f', '#ffb84d'], 'fill-opacity': 0.15 },
+  });
+  map.addLayer({
+    id: 'zones-line', type: 'line', source: 'zones',
+    paint: { 'line-color': ['case', ['==', ['get', 'kind'], 'no_fly'], '#ff4d4f', '#ffb84d'], 'line-width': 1.5 },
+  });
+
+  // Worldwide airports/heliports (~70k+ points) -- cheap to render as plain
+  // circles (no polygon tessellation), sized/colored by facility type and
+  // scaled up on zoom so the map isn't a solid mass of dots at low zoom.
+  map.addSource('airports', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'airports-layer', type: 'circle', source: 'airports',
+    minzoom: 3,
+    paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 3, 1.2, 8, 3.5, 14, 7],
+      'circle-color': ['match', ['get', 'type'],
+        'heliport', '#38c9c9',
+        'large_airport', '#4c8dff',
+        'medium_airport', '#7fb2ff',
+        '#8a97a8'],
+      'circle-opacity': ['interpolate', ['linear'], ['zoom'], 3, 0.5, 8, 0.9],
+      'circle-stroke-width': 0.6, 'circle-stroke-color': '#0a0d12',
+    },
+  });
+
+  // Selected airport's actual runway footprint (rotated rectangles built
+  // from OurAirports runway endpoint+width data -- see renderAirportOutline()).
+  // Only populated for the currently-selected airport, not all of them,
+  // same "on demand, not always-on" pattern as selection-ring.
+  map.addSource('airport-outline', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'airport-outline-fill', type: 'fill', source: 'airport-outline',
+    paint: { 'fill-color': '#ffb84d', 'fill-opacity': 0.25 },
+  });
+  map.addLayer({
+    id: 'airport-outline-line', type: 'line', source: 'airport-outline',
+    paint: { 'line-color': '#ffb84d', 'line-width': 2 },
+  });
+
+  // Selected airport's actual property/perimeter boundary (OpenStreetMap,
+  // fetched on demand -- see renderAirportPerimeter()/airport_boundary.hpp).
+  // A separate, more subtle style from the runway outline above so both
+  // can be visible together without one drowning out the other.
+  map.addSource('airport-perimeter', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'airport-perimeter-line', type: 'line', source: 'airport-perimeter',
+    paint: { 'line-color': '#7fe0ff', 'line-width': 1.5, 'line-dasharray': [2, 1.5] },
+  });
+
+  map.addSource('selection-ring', { type: 'geojson', data: emptyFC() });
+  map.addLayer({
+    id: 'selection-ring-layer', type: 'circle', source: 'selection-ring',
+    paint: {
+      'circle-radius': 14, 'circle-color': 'transparent',
+      'circle-stroke-width': 2.5, 'circle-stroke-color': '#ff2d2d', 'circle-stroke-opacity': 0.95,
+    },
+  });
+  animateSelectionRing();
+
+  map.on('click', 'aircraft-layer', (e) => selectAircraft(e.features[0].properties.icao24));
+  map.on('click', 'drones-layer', (e) => selectTrack(parseInt(e.features[0].properties.track_id)));
+  map.on('click', 'zones-fill', (e) => selectZone(e.features[0].properties.name));
+  map.on('click', 'airports-layer', (e) => selectAirport(e.features[0].properties.ident));
+  map.on('click', 'history-tracks-layer', (e) => {
+    const p = e.features[0].properties;
+    if (p.classification === 'aircraft') selectHistoryAircraft(p.track_id);
+    else selectHistoryTrack(parseInt(p.track_id));
+  });
+  map.on('click', 'history-incidents-layer', (e) => {
+    const p = e.features[0].properties;
+    const inc = historyWindow && historyWindow.incidents.find(x => x.incident_id === parseInt(p.incident_id));
+    if (inc) { selectedId = { type: 'incident', id: inc.incident_id, data: inc }; renderBottomPanels(); }
+  });
+  ['aircraft-layer', 'drones-layer', 'zones-fill', 'airports-layer', 'history-tracks-layer', 'history-incidents-layer'].forEach(l => {
+    map.on('mouseenter', l, () => map.getCanvas().style.cursor = 'pointer');
+    map.on('mouseleave', l, () => map.getCanvas().style.cursor = '');
+  });
+
+  tick();
+  setInterval(tick, 3000);
+  // Airspace polygons and the airports directory both change server-side at
+  // most once a day (airspace) or once a week (airports) -- polling them on
+  // the fast 3s tick was re-fetching and re-parsing tens of MB of JSON, and
+  // re-rendering thousands of map features, dozens of times a minute for no
+  // reason. Fetch them far less often.
+  fetchAirspace();
+  setInterval(fetchAirspace, 5 * 60 * 1000);
+  fetchAirports();
+  setInterval(fetchAirports, 5 * 60 * 1000);
+  fetchRunways();
+  setInterval(fetchRunways, 5 * 60 * 1000);
+  requestAnimationFrame(renderLoop);
+});
+
+function emptyFC() { return { type: 'FeatureCollection', features: [] }; }
+
+let lastRenderMs = 0;
+function renderLoop(ts) {
+  if (ts - lastRenderMs >= 150) {
+    renderMapLayers();
+    lastRenderMs = ts;
+  }
+  requestAnimationFrame(renderLoop);
+}
+
+// ==================== Map control buttons ====================
+document.getElementById('btn-2d').onclick = () => setProjection(false);
+document.getElementById('btn-3d').onclick = () => setProjection(true);
+function setProjection(threeD) {
+  use3D = threeD;
+  document.getElementById('btn-2d').classList.toggle('active', !threeD);
+  document.getElementById('btn-3d').classList.toggle('active', threeD);
+  map.easeTo({ pitch: threeD ? 55 : 0, duration: 500 });
+  try {
+    map.setProjection({ type: threeD ? 'globe' : 'mercator' });
+  } catch (e) {
+    console.error('setProjection failed:', e);
+  }
+}
+
+document.getElementById('btn-terrain').onclick = () => {
+  terrainOn = !terrainOn;
+  document.getElementById('btn-terrain').classList.toggle('active', terrainOn);
+  document.getElementById('dot-terrain').classList.toggle('on', terrainOn);
+  map.setTerrain(terrainOn ? { source: 'terrainSource', exaggeration: 1.4 } : null);
+};
+
+document.getElementById('btn-satellite').onclick = () => setBasemap('satellite');
+document.getElementById('btn-road').onclick = () => setBasemap('road');
+function setBasemap(which) {
+  basemap = which;
+  document.getElementById('btn-satellite').classList.toggle('active', which === 'satellite');
+  document.getElementById('btn-road').classList.toggle('active', which === 'road');
+  if (map.getLayer('basemap')) map.removeLayer('basemap');
+  if (map.getSource('basemap')) map.removeSource('basemap');
+  map.addSource('basemap', which === 'satellite' ? SATELLITE_SOURCE : ROAD_SOURCE);
+  const layers = map.getStyle().layers;
+  const insertBefore = layers[1] ? layers[1].id : undefined; // keep space-bg at the very bottom
+  map.addLayer({ id: 'basemap', type: 'raster', source: 'basemap' }, insertBefore);
+}
+
+function wireToggle(btnId, dotId, getter, setter) {
+  document.getElementById(btnId).onclick = () => {
+    const v = !getter();
+    setter(v);
+    document.getElementById(btnId).classList.toggle('active', v);
+    document.getElementById(dotId).classList.toggle('on', v);
+    renderMapLayers();
+    renderZonesLayer();
+    renderAirportsLayer();
+  };
+}
+wireToggle('toggle-aircraft', 'dot-aircraft', () => showAircraft, v => showAircraft = v);
+wireToggle('toggle-helicopter', 'dot-helicopter', () => showHelicopter, v => showHelicopter = v);
+wireToggle('toggle-drone', 'dot-drone', () => showDrone, v => showDrone = v);
+wireToggle('toggle-airports', 'dot-airports', () => showAirports, v => showAirports = v);
+
+// ==================== Historical replay ====================
+function setHistoryControlsVisible(visible) {
+  document.getElementById('history-controls').classList.toggle('hidden', !visible);
+}
+
+async function loadHistoryWindow(rangeSeconds) {
+  const end = Date.now() / 1000;
+  const start = end - rangeSeconds;
+  const data = await fetchJson(`/api/history/window?start=${start}&end=${end}`);
+  if (!data) return;
+  historyWindow = data;
+  // Scrub to the most recent moment that actually has data, not literally
+  // data.end (the wall-clock time of this fetch) -- aircraft/track logging
+  // always lags a bit behind "now" (snapshot interval, poll timing), so
+  // landing exactly on data.end means every entity's own observed range
+  // ends slightly before the scrubber position, and combined with only
+  // rendering entities within their own observed span (see
+  // renderHistoryLayer), that made the tab open on an empty map.
+  let latestObservedMs = data.start * 1000;
+  for (const t of data.tracks) {
+    if (t.points.length) latestObservedMs = Math.max(latestObservedMs, t.points[t.points.length - 1].timestamp * 1000);
+  }
+  for (const a of (data.aircraft || [])) {
+    if (a.points.length) latestObservedMs = Math.max(latestObservedMs, a.points[a.points.length - 1].timestamp * 1000);
+  }
+  historyScrubMs = latestObservedMs;
+  const scrub = document.getElementById('history-scrub');
+  const spanMs = (data.end - data.start) * 1000;
+  scrub.value = spanMs > 0 ? Math.round(1000 * (historyScrubMs - data.start * 1000) / spanMs) : scrub.max;
+  updateHistoryTimeLabel();
+  renderHistoryLayer();
+}
+
+// Linear interpolation between the two points bracketing tMs (clamped to
+// the first/last point outside the track's own time range) -- this is
+// what lets the scrubber show smooth motion between the actual detection
+// timestamps rather than jumping point to point.
+function interpolateAtTime(points, tMs) {
+  if (!points.length) return null;
+  const tS = tMs / 1000;
+  if (points.length === 1 || tS <= points[0].timestamp) return points[0];
+  if (tS >= points[points.length - 1].timestamp) return points[points.length - 1];
+  for (let i = 1; i < points.length; i++) {
+    if (tS <= points[i].timestamp) {
+      const a = points[i - 1], b = points[i];
+      const span = b.timestamp - a.timestamp;
+      const frac = span > 0 ? (tS - a.timestamp) / span : 0;
+      const hasAlt = a.alt_m != null && b.alt_m != null;
+      return {
+        lat: a.lat + (b.lat - a.lat) * frac,
+        lon: a.lon + (b.lon - a.lon) * frac,
+        alt_m: hasAlt ? a.alt_m + (b.alt_m - a.alt_m) * frac : (a.alt_m ?? b.alt_m ?? null),
+        timestamp: tS,
+      };
+    }
+  }
+  return points[points.length - 1];
+}
+
+function updateHistoryTimeLabel() {
+  document.getElementById('history-time-label').textContent =
+    historyWindow ? new Date(historyScrubMs).toLocaleString() : '--';
+}
+
+// interpolateAtTime clamps to the first/last point for scrub times outside
+// an entity's own observed range -- necessary so a single out-of-range call
+// doesn't crash, but it means every track/aircraft that was only observed
+// for part of the window would otherwise render for the *entire* window,
+// frozen at its entry position until its real first sighting and frozen at
+// its exit position after its last one. With a 1h+ window and most aircraft
+// only in a 250nm radius for a fraction of that, the vast majority of dots
+// on screen at any given moment would be these frozen clamped ones
+// drowning out the few actually interpolating -- which is exactly what
+// reads as "the planes aren't moving". Only rendering/tracking an entity
+// within its own observed span fixes that: dots (and the selection
+// ring/detail panel for whichever one is selected) appear when a plane is
+// actually first seen, move for as long as it's actually tracked, and
+// disappear when it actually leaves coverage. Shared by renderHistoryLayer,
+// updateSelectionRing, and renderDetail so all three agree on when a
+// historical entity "exists" at the current scrub time.
+function inOwnRange(points, tMs) {
+  return points.length > 0 && tMs >= points[0].timestamp * 1000 && tMs <= points[points.length - 1].timestamp * 1000;
+}
+
+function renderHistoryLayer() {
+  if (!map.getSource('history-tracks')) return;
+  if (mode !== 'history' || !historyWindow) {
+    map.getSource('history-tracks').setData(emptyFC());
+    map.getSource('history-trails').setData(emptyFC());
+    map.getSource('history-incidents').setData(emptyFC());
+    return;
+  }
+
+  const trackFeatures = [], trailFeatures = [];
+  for (const t of historyWindow.tracks) {
+    if (inOwnRange(t.points, historyScrubMs)) {
+      const pos = interpolateAtTime(t.points, historyScrubMs);
+      trackFeatures.push({
+        type: 'Feature', geometry: { type: 'Point', coordinates: [pos.lon, pos.lat] },
+        properties: { track_id: t.track_id, classification: t.classification },
+      });
+    }
+    // Only the trail up to the current scrub time, so it draws in as the
+    // scrubber/playback advances rather than showing the full path at once.
+    const upTo = t.points.filter(p => p.timestamp * 1000 <= historyScrubMs);
+    if (upTo.length >= 2) {
+      trailFeatures.push({
+        type: 'Feature', geometry: { type: 'LineString', coordinates: upTo.map(p => [p.lon, p.lat]) },
+        properties: { track_id: t.track_id, classification: t.classification },
+      });
+    }
+  }
+  // Aircraft history points (no trails -- resolution is only as fine as
+  // AIRCRAFT_SNAPSHOT_INTERVAL_SECONDS server-side, typically 5min, and
+  // there can be hundreds-to-thousands of them, so trails would both be
+  // visually meaningless at that resolution and expensive to draw).
+  // Reuses the same layer/classification-color styling as tracks --
+  // "aircraft" already has its own color in CLASSIFICATION_COLOR_EXPR.
+  for (const a of (historyWindow.aircraft || [])) {
+    if (!inOwnRange(a.points, historyScrubMs)) continue;
+    const pos = interpolateAtTime(a.points, historyScrubMs);
+    trackFeatures.push({
+      type: 'Feature', geometry: { type: 'Point', coordinates: [pos.lon, pos.lat] },
+      properties: { track_id: a.icao24, classification: 'aircraft', callsign: a.callsign },
+    });
+  }
+  map.getSource('history-tracks').setData({ type: 'FeatureCollection', features: trackFeatures });
+  map.getSource('history-trails').setData({ type: 'FeatureCollection', features: trailFeatures });
+
+  const incidentFeatures = historyWindow.incidents
+    .filter(inc => inc.timestamp * 1000 <= historyScrubMs)
+    .map(inc => ({
+      type: 'Feature', geometry: { type: 'Point', coordinates: [inc.lon, inc.lat] },
+      properties: { incident_id: inc.incident_id, classification: inc.classification, reason: inc.reason },
+    }));
+  map.getSource('history-incidents').setData({ type: 'FeatureCollection', features: incidentFeatures });
+
+  // Keep a selected historical track/aircraft's detail panel + selection
+  // ring following it as the scrubber/playback advances, instead of
+  // freezing both at wherever the entity was when it was first clicked.
+  if (selectedId && (selectedId.type === 'history-track' || selectedId.type === 'history-aircraft')) {
+    renderDetail();
+  }
+}
+
+function stopHistoryPlayback() {
+  historyPlaying = false;
+  if (historyPlayTimer) { clearInterval(historyPlayTimer); historyPlayTimer = null; }
+  document.getElementById('history-play').innerHTML = '<i data-lucide="play"></i>';
+  if (window.lucide) lucide.createIcons();
+}
+
+function startHistoryPlayback() {
+  if (!historyWindow) return;
+  historyPlaying = true;
+  document.getElementById('history-play').innerHTML = '<i data-lucide="pause"></i>';
+  if (window.lucide) lucide.createIcons();
+  historyPlayTimer = setInterval(() => {
+    historyScrubMs += HISTORY_PLAYBACK_SPEED * 1000 * 0.25; // ticks every 250ms
+    const startMs = historyWindow.start * 1000, endMs = historyWindow.end * 1000;
+    if (historyScrubMs >= endMs) { historyScrubMs = endMs; stopHistoryPlayback(); }
+    const scrub = document.getElementById('history-scrub');
+    scrub.value = endMs > startMs ? Math.round(((historyScrubMs - startMs) / (endMs - startMs)) * 1000) : 1000;
+    updateHistoryTimeLabel();
+    renderHistoryLayer();
+  }, 250);
+}
+
+document.querySelectorAll('#history-controls [data-range]').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('#history-controls [data-range]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    stopHistoryPlayback();
+    loadHistoryWindow(parseInt(btn.dataset.range, 10));
+  };
+});
+
+document.getElementById('history-scrub').addEventListener('input', (e) => {
+  if (!historyWindow) return;
+  stopHistoryPlayback();
+  const frac = parseInt(e.target.value, 10) / 1000;
+  historyScrubMs = historyWindow.start * 1000 + frac * (historyWindow.end - historyWindow.start) * 1000;
+  updateHistoryTimeLabel();
+  renderHistoryLayer();
+});
+
+document.getElementById('history-play').onclick = () => {
+  if (historyPlaying) stopHistoryPlayback(); else startHistoryPlayback();
+};
+
+// ==================== Left nav ====================
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.onclick = () => {
+    document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+    item.classList.add('active');
+    mode = item.dataset.mode;
+    selectedId = null;
+    lastFlyTarget = null;
+
+    setHistoryControlsVisible(mode === 'history');
+    // The live aircraft/drone layers redraw continuously off the ~150ms
+    // render loop regardless of mode (see renderMapLayers()), so without
+    // this they'd keep showing current positions on top of the History
+    // tab's own historical dots -- confusing "current planes" mixed into
+    // a view that's supposed to be a past-time snapshot.
+    ['aircraft-layer', 'drones-layer'].forEach(l => {
+      if (map.getLayer(l)) map.setLayoutProperty(l, 'visibility', mode === 'history' ? 'none' : 'visible');
+    });
+    if (mode === 'history') {
+      if (!historyWindow) {
+        const defaultBtn = document.querySelector('#history-controls [data-range="3600"]');
+        if (defaultBtn) defaultBtn.classList.add('active');
+        loadHistoryWindow(3600);
+      } else {
+        renderHistoryLayer();
+      }
+    } else {
+      stopHistoryPlayback();
+      renderHistoryLayer(); // clears the history layers when leaving the tab
+    }
+    renderBottomPanels();
+  };
+});
+
+document.getElementById('search-box').addEventListener('input', renderBottomPanels);
+
+// ==================== Data fetching ====================
+async function fetchJson(url) {
+  try {
+    const res = await fetch(url);
+    apiOk = true;
+    return await res.json();
+  } catch (e) {
+    apiOk = false;
+    return null;
+  }
+}
+
+async function tick() {
+  const results = await Promise.all([
+    fetchJson('/api/tracks'), fetchJson('/api/aircraft'), fetchJson('/api/incidents?limit=100'),
+    fetchJson('/api/zones'),
+  ]);
+  const tracks = results[0], aircraft = results[1], incidents = results[2], zones = results[3];
+  if (tracks) tracksData = tracks;
+  // Use each source's own last_poll time, not Date.now(): the frontend
+  // fetches every 3s but each backing feed is only actually repolled on
+  // its own cadence server-side (OpenSky ~12s, the community feeds
+  // ~25s+), so most fetches just return the same cached snapshot.
+  // Resetting the extrapolation base on every fetch (rather than only
+  // when the underlying data changes) made planes dead-reckon forward for
+  // ~3s then snap back to the old position each time a same-snapshot
+  // fetch landed -- a back-and-forth sawtooth instead of continuous
+  // motion.
+  //
+  // This has to be tracked *per source*, not as one shared timestamp:
+  // with 3 independently-polled feeds merged together, a single global
+  // "last_poll" is whichever source happened to poll most recently --
+  // often OpenSky, which keeps repolling every 12s even while returning 0
+  // aircraft (rate-limited). Stamping every aircraft's extrapolation base
+  // with OpenSky's poll time, when the aircraft's actual position came
+  // from adsb.lol/airplanes.live up to ~25-45s earlier, way overshoots
+  // the dead-reckoning projection -- then the real next poll from that
+  // aircraft's actual source corrects it, which reads as the aircraft
+  // jumping backward. Each aircraft is extrapolated from when *its own*
+  // source last actually updated instead.
+  if (aircraft) {
+    aircraftData = aircraft.aircraft || [];
+    sourceLastPoll = {};
+    for (const [src, info] of Object.entries(aircraft.sources || {})) {
+      if (info.last_poll) sourceLastPoll[src] = info.last_poll * 1000;
+    }
+    if (aircraft.last_poll) aircraftFetchedAt = aircraft.last_poll * 1000; // fallback for unrecognized/missing source tags
+    // Drop smoothing state for aircraft no longer in the feed, otherwise
+    // lastRenderedPos grows for as long as the tab stays open.
+    const liveIcaos = new Set(aircraftData.map(a => a.icao24));
+    for (const icao of lastRenderedPos.keys()) if (!liveIcaos.has(icao)) lastRenderedPos.delete(icao);
+  }
+  if (incidents) incidentsData = incidents;
+  if (zones) zonesData = zones;
+
+  document.getElementById('conn-dot').classList.toggle('offline', !apiOk);
+  document.getElementById('conn-text').textContent = apiOk ? 'Connected' : 'Disconnected';
+  document.getElementById('track-count').textContent = tracksData.length;
+  document.getElementById('plane-count').textContent = aircraftData.length;
+
+  renderZonesLayer();
+  renderBottomPanels();
+}
+
+async function fetchAirspace() {
+  const airspace = await fetchJson('/api/airspace');
+  if (!airspace) return;
+  airspaceData = airspace;
+  renderZonesLayer();
+  renderBottomPanels();
+}
+
+async function fetchAirports() {
+  const airports = await fetchJson('/api/airports');
+  if (!airports) return;
+  airportsData = airports.airports || [];
+  renderAirportsLayer();
+  renderBottomPanels();
+}
+
+async function fetchRunways() {
+  const runways = await fetchJson('/api/runways');
+  if (!runways) return;
+  runwaysData = runways.runways || [];
+  if (selectedId && selectedId.type === 'airport') renderAirportOutline(selectedId.id);
+}
+
+// Local tangent-plane meters->degrees offset, same approximation already
+// used by extrapolatedPosition() elsewhere in this file.
+function metersOffset(lat, lon, bearingDeg, distM) {
+  const rad = bearingDeg * Math.PI / 180;
+  const dLat = (distM * Math.cos(rad)) / 111320;
+  const dLon = (distM * Math.sin(rad)) / (111320 * Math.cos(lat * Math.PI / 180));
+  return [lon + dLon, lat + dLat];
+}
+
+// Builds a rotated rectangle (closed ring) for one runway from its two
+// endpoint coordinates and width -- bearing is derived from the endpoints
+// themselves (le->he) rather than trusting the CSV's heading field, since
+// that's only ever populated for one end and the endpoints are already
+// exactly what's needed. Falls back to a 30m width when OurAirports
+// doesn't have one on file, purely so the runway is visible at all rather
+// than collapsing to an invisible zero-width line.
+function runwayRectangle(rw) {
+  const dLat = rw.he_lat - rw.le_lat, dLon = rw.he_lon - rw.le_lon;
+  const bearing = Math.atan2(dLon * Math.cos(rw.le_lat * Math.PI / 180), dLat) * 180 / Math.PI;
+  const perp = bearing + 90;
+  const halfWidthM = (rw.width_ft ? rw.width_ft * 0.3048 : 30) / 2;
+  const c1 = metersOffset(rw.le_lat, rw.le_lon, perp, halfWidthM);
+  const c2 = metersOffset(rw.le_lat, rw.le_lon, perp + 180, halfWidthM);
+  const c3 = metersOffset(rw.he_lat, rw.he_lon, perp + 180, halfWidthM);
+  const c4 = metersOffset(rw.he_lat, rw.he_lon, perp, halfWidthM);
+  return [c1, c2, c3, c4, c1];
+}
+
+// Draws the selected airport's actual runway footprint -- the literal
+// "outline of the airport" -- rather than just a point marker. Clears the
+// layer (rather than leaving a stale outline) when the airport has no
+// runway geometry on file; see runways_feed.hpp for why that's common for
+// small airstrips.
+function renderAirportOutline(ident) {
+  if (!map.getSource('airport-outline')) return;
+  const matches = runwaysData.filter(r => r.airport_ident === ident);
+  const features = matches.map(rw => ({
+    type: 'Feature',
+    geometry: { type: 'Polygon', coordinates: [runwayRectangle(rw)] },
+    properties: { airport_ident: ident, runway: `${rw.le_ident}/${rw.he_ident}` },
+  }));
+  map.getSource('airport-outline').setData({ type: 'FeatureCollection', features });
+  return matches.length;
+}
+
+// Sequence guard so a slow response for an airport the user has since
+// clicked away from can't land after (and stomp) a newer selection's
+// perimeter -- same pattern as registrySeq for registry search.
+let airportPerimeterSeq = 0;
+
+// Draws the selected airport's actual property/perimeter boundary --
+// "all around the airport", not just its runways -- from OpenStreetMap
+// via the backend's on-demand Overpass lookup. Async (a live network
+// lookup, not pre-loaded data like runways/airports), so this clears the
+// layer immediately and repopulates it once the response lands.
+async function renderAirportPerimeter(ap) {
+  if (!map.getSource('airport-perimeter')) return;
+  const mySeq = ++airportPerimeterSeq;
+  map.getSource('airport-perimeter').setData(emptyFC());
+
+  const params = new URLSearchParams({ ident: ap.ident, lat: ap.lat, lon: ap.lon });
+  if (ap.icao_code) params.set('icao', ap.icao_code);
+  const result = await fetchJson(`/api/airport_boundary?${params.toString()}`);
+  if (mySeq !== airportPerimeterSeq) return; // superseded by a newer selection
+  if (!result || !result.found || !result.ring || result.ring.length < 3) return; // stays cleared; see airport_boundary.hpp on OSM coverage gaps
+
+  const ring = result.ring.slice();
+  const first = ring[0], last = ring[ring.length - 1];
+  if (first[0] !== last[0] || first[1] !== last[1]) ring.push(first); // GeoJSON polygons must be closed rings
+  map.getSource('airport-perimeter').setData({
+    type: 'FeatureCollection',
+    features: [{ type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] }, properties: { name: result.name } }],
+  });
+}
+
+// Prefer OpenSky's real ADS-B emitter category (category_known: true means
+// the aircraft actually reported one) over the old altitude+speed guess --
+// category 8 is rotorcraft, 14 is UAV. Falls back to the heuristic only
+// when the feed didn't report a category for that aircraft.
+function isHelicopterLike(ac) {
+  if (ac.category_known) return !!ac.is_helicopter;
+  return !ac.on_ground && (ac.altitude_m == null ? 9999 : ac.altitude_m) < 1000
+    && (ac.velocity_mps == null ? 999 : ac.velocity_mps) < 60;
+}
+
+function isUavLike(ac) {
+  return ac.category_known && !!ac.is_uav;
+}
+
+// Dead-reckoning: OpenSky updates roughly every 12s server-side, but the
+// community feeds (adsb.lol/airplanes.live) sweep many regions with
+// deliberate per-request spacing to stay under those services' rate
+// limits, so any one aircraft's real position from those sources can
+// legitimately go 40-60s+ between refreshes -- confirmed live. The cap
+// here has to be well above that "normal, nothing's wrong" cadence, or
+// it fires constantly during ordinary operation and every plane sourced
+// from those feeds visibly freezes mid-cycle instead of continuing to
+// move. 90s only kicks in for a genuinely stalled/dead feed.
+function extrapolatedPosition(ac, nowMs) {
+  const fetchedAt = (ac.source && sourceLastPoll[ac.source]) || aircraftFetchedAt;
+  const elapsedS = Math.min((nowMs - fetchedAt) / 1000, 90);
+  if (ac.on_ground || elapsedS <= 0 || ac.velocity_mps == null || ac.heading_deg == null) {
+    return [ac.lon, ac.lat];
+  }
+  const distM = ac.velocity_mps * elapsedS;
+  const headingRad = ac.heading_deg * Math.PI / 180;
+  const dLat = (distM * Math.cos(headingRad)) / 111320;
+  const dLon = (distM * Math.sin(headingRad)) / (111320 * Math.cos(ac.lat * Math.PI / 180));
+  return [ac.lon + dLon, ac.lat + dLat];
+}
+
+// Eases the rendered position toward the dead-reckoned target instead of
+// snapping straight to it, so a correction (in either direction) plays out
+// over ~1s of render frames rather than as a single visible teleport.
+function smoothedPosition(icao24, target) {
+  const prev = lastRenderedPos.get(icao24);
+  if (!prev) { lastRenderedPos.set(icao24, target); return target; }
+  const factor = 0.25;
+  const next = [prev[0] + (target[0] - prev[0]) * factor, prev[1] + (target[1] - prev[1]) * factor];
+  lastRenderedPos.set(icao24, next);
+  return next;
+}
+
+function renderMapLayers() {
+  if (!map.getSource('aircraft')) return;
+  const nowMs = Date.now();
+
+  const acFeatures = aircraftData
+    .filter(a => isHelicopterLike(a) ? showHelicopter : showAircraft)
+    .map(a => {
+      const pos = smoothedPosition(a.icao24, extrapolatedPosition(a, nowMs));
+      return {
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: pos },
+        properties: {
+          icao24: a.icao24, callsign: a.callsign, heli: isHelicopterLike(a),
+          icon: isHelicopterLike(a) ? 'heli-icon' : 'plane-icon',
+          heading: a.heading_deg == null ? 0 : a.heading_deg,
+        },
+      };
+    });
+  map.getSource('aircraft').setData({ type: 'FeatureCollection', features: acFeatures });
+
+  updateSelectionRing();
+}
+
+// Drones (tracksData) and zones (zonesData + airspaceData) only change once
+// per tick()/fetchAirspace() call -- unlike aircraft, they don't need
+// continuous per-frame extrapolation, so this is called from those data
+// updates instead of the ~150ms render loop. Rebuilding and re-tessellating
+// ~3000 FAA polygons 6+ times a second was the main source of UI lag.
+function renderZonesLayer() {
+  if (!map.getSource('drones')) return;
+
+  const droneFeatures = showDrone ? tracksData.map(t => ({
+    type: 'Feature',
+    geometry: { type: 'Point', coordinates: [t.lon, t.lat] },
+    properties: { track_id: t.track_id, classification: t.classification, confidence: t.confidence },
+  })) : [];
+  map.getSource('drones').setData({ type: 'FeatureCollection', features: droneFeatures });
+
+  const zoneFeatures = [];
+  for (const z of zonesData) zoneFeatures.push(polyFeature(z.name, 'no_fly', z.polygon));
+  for (const a of (airspaceData.faa_uas_facility_map || [])) zoneFeatures.push(polyFeature(a.name, 'altitude_ceiling', a.polygon));
+  for (const a of (airspaceData.faa_national_security_restrictions || [])) zoneFeatures.push(polyFeature(a.name, 'no_fly', a.polygon));
+  for (const a of (airspaceData.faa_tfr || [])) zoneFeatures.push(polyFeature(a.name, 'no_fly', a.polygon));
+  for (const a of (airspaceData.openaip_restrictions || [])) zoneFeatures.push(polyFeature(a.name, 'no_fly', a.polygon));
+  map.getSource('zones').setData({ type: 'FeatureCollection', features: zoneFeatures });
+}
+
+function polyFeature(name, kind, ring) {
+  if (!ring || !ring.length) return { type: 'Feature', geometry: { type: 'Polygon', coordinates: [[]] }, properties: { name, kind } };
+  const coords = ring.map(p => [p[1], p[0]]);
+  return { type: 'Feature', geometry: { type: 'Polygon', coordinates: [coords] }, properties: { name, kind } };
+}
+
+// Airports change at most weekly server-side -- only rebuilt when
+// fetchAirports() lands new data, not on the per-frame render loop.
+function renderAirportsLayer() {
+  if (!map.getSource('airports')) return;
+  const features = showAirports ? airportsData.map(a => ({
+    type: 'Feature',
+    geometry: { type: 'Point', coordinates: [a.lon, a.lat] },
+    properties: { ident: a.ident, name: a.name, type: a.type },
+  })) : [];
+  map.getSource('airports').setData({ type: 'FeatureCollection', features });
+}
+
+// ==================== Selection ====================
+function selectTrack(id) { selectedId = { type: 'track', id }; renderBottomPanels(); }
+function selectAircraft(icao) { selectedId = { type: 'aircraft', id: icao }; renderBottomPanels(); }
+function selectZone(name) { selectedId = { type: 'zone', id: name }; renderBottomPanels(); }
+function selectAirport(ident) { selectedId = { type: 'airport', id: ident }; renderBottomPanels(); }
+
+// Historical tracks/aircraft may no longer exist in the live tracksData/
+// aircraftData arrays (track dropped, aircraft out of range), so unlike
+// selectTrack/selectAircraft above, these look up the record from the
+// loaded history window and carry it directly on selectedId.data. Position
+// is deliberately NOT precomputed/frozen here -- both updateSelectionRing()
+// and renderDetail() recompute it from selectedId.data.points against the
+// *current* historyScrubMs each time they're called (renderHistoryLayer
+// calls renderDetail() on every scrub/playback tick), so the ring and
+// panel keep following the entity as playback advances instead of sticking
+// at the position it was at when clicked.
+function selectHistoryTrack(id) {
+  const t = historyWindow && historyWindow.tracks.find(x => x.track_id === id);
+  if (!t) return;
+  selectedId = { type: 'history-track', id, data: t };
+  renderBottomPanels();
+}
+function selectHistoryAircraft(icao) {
+  const a = historyWindow && historyWindow.aircraft.find(x => x.icao24 === icao);
+  if (!a) return;
+  selectedId = { type: 'history-aircraft', id: icao, data: a };
+  renderBottomPanels();
+}
+
+// ==================== Registry search ====================
+// Sequence guard: if the user keeps typing, later keystrokes fire newer
+// searches before earlier ones' network round-trips finish -- without
+// this, a slow early response landing after a faster later one would
+// stomp the results back to something stale.
+let registrySeq = 0;
+
+function selectRegistryAircraft(data) { selectedId = { type: 'registry-aircraft', data }; renderDetail(); }
+function selectRegistryType(code, data) { selectedId = { type: 'registry-type', id: code, data }; renderDetail(); }
+
+async function runRegistrySearch(query) {
+  const mySeq = ++registrySeq;
+  const listTitle = document.getElementById('list-title');
+  const listContent = document.getElementById('list-content');
+  listTitle.textContent = 'Aircraft / Type / Airport Lookup';
+
+  if (!query) {
+    document.getElementById('list-count').textContent = 0;
+    listContent.innerHTML = '<div id="detail-empty">Search a US N-number (N12345), an ICAO24 hex address (a05b7e), an ICAO type designator (B738), or an airport name/ident.</div>';
+    return;
+  }
+
+  // Query-shape sniffing decides which backend lookups are worth firing --
+  // an N-number and a 6-hex-digit icao24 and a short type code look
+  // different enough that trying all three on every keystroke would just
+  // be wasted requests (and 404-ish "not found" noise) most of the time.
+  const looksLikeIcao24 = /^[0-9a-f]{6}$/i.test(query);
+  const looksLikeNNumber = /^n?[0-9][0-9a-z]{0,5}$/i.test(query) && !looksLikeIcao24;
+  const looksLikeTypeCode = /^[a-z0-9]{2,4}$/i.test(query);
+
+  const jobs = [];
+  if (looksLikeIcao24) jobs.push(fetchJson(`/api/registry/aircraft?icao24=${encodeURIComponent(query)}`).then(r => ({ kind: 'aircraft', r })));
+  if (looksLikeNNumber) jobs.push(fetchJson(`/api/registry/aircraft?n_number=${encodeURIComponent(query)}`).then(r => ({ kind: 'aircraft', r })));
+  if (looksLikeTypeCode) jobs.push(fetchJson(`/api/registry/type?code=${encodeURIComponent(query)}`).then(r => ({ kind: 'type', code: query.toUpperCase(), r })));
+
+  const airportMatches = airportsData.filter(a =>
+    (a.name && a.name.toLowerCase().includes(query)) || (a.ident && a.ident.toLowerCase().includes(query)) ||
+    (a.icao_code && a.icao_code.toLowerCase().includes(query)) || (a.iata_code && a.iata_code.toLowerCase().includes(query))
+  ).slice(0, 20);
+
+  const settled = await Promise.all(jobs);
+  if (mySeq !== registrySeq) return; // superseded by a newer keystroke's search
+
+  const rows = [];
+  for (const { kind, r, code } of settled) {
+    if (!r) continue;
+    if (kind === 'aircraft' && r.found) {
+      const fr = r.faa_registry;
+      rows.push(rowHtml(`${fr.n_number} — ${escapeHtml(fr.manufacturer || 'Unknown mfr')} ${escapeHtml(fr.model || '')}`.trim(),
+        `${fr.registrant_name || 'Unknown owner'} · ${fr.city || '?'}, ${fr.state || '?'}${fr.icao24 ? ' · ' + fr.icao24 : ''}`,
+        fr.is_helicopter ? 'high' : '', () => selectRegistryAircraft(r)));
+    }
+    if (kind === 'type' && r.found) {
+      rows.push(rowHtml(`${code} — ${escapeHtml(r.manufacturer)} ${escapeHtml(r.model)}`,
+        r.is_helicopter ? 'Helicopter' : 'Fixed-wing', r.is_helicopter ? 'high' : '',
+        () => selectRegistryType(code, r)));
+    }
+  }
+  for (const a of airportMatches) {
+    rows.push(rowHtml(`▲ ${a.name || a.ident}`, `${a.municipality || a.iso_country || ''} · ${(a.type || '').replace(/_/g, ' ')}`,
+      '', () => selectAirport(a.ident)));
+  }
+
+  document.getElementById('list-count').textContent = rows.length;
+  listContent.innerHTML = rows.join('') || '<div id="detail-empty">No matches. Try an N-number, ICAO24 hex, type code, or airport name.</div>';
+  renderDetail();
+}
+
+function updateSelectionRing() {
+  if (!map.getSource('selection-ring')) return;
+  let point = null;
+  if (selectedId && selectedId.type === 'aircraft') {
+    const a = aircraftData.find(x => x.icao24 === selectedId.id);
+    if (a) point = extrapolatedPosition(a, Date.now());
+  } else if (selectedId && selectedId.type === 'track') {
+    const t = tracksData.find(x => x.track_id === selectedId.id);
+    if (t) point = [t.lon, t.lat];
+  } else if (selectedId && (selectedId.type === 'history-track' || selectedId.type === 'history-aircraft')) {
+    const points = selectedId.data.points;
+    if (inOwnRange(points, historyScrubMs)) {
+      const pos = interpolateAtTime(points, historyScrubMs);
+      point = [pos.lon, pos.lat];
+    }
+  }
+  map.getSource('selection-ring').setData(
+    point ? { type: 'FeatureCollection', features: [{ type: 'Feature', geometry: { type: 'Point', coordinates: point }, properties: {} }] }
+          : emptyFC()
+  );
+}
+
+function animateSelectionRing() {
+  const period = 1600;
+  function frame(ts) {
+    if (map.getLayer('selection-ring-layer')) {
+      const phase = (ts % period) / period;
+      const radius = 12 + Math.sin(phase * Math.PI * 2) * 4;
+      map.setPaintProperty('selection-ring-layer', 'circle-radius', radius);
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+function flyToOnce(type, id, lon, lat, minZoom) {
+  const key = type + ':' + id;
+  if (lastFlyTarget === key) return; // don't fight manual panning on re-renders of the same selection
+  lastFlyTarget = key;
+  map.flyTo({ center: [lon, lat], zoom: Math.max(map.getZoom(), minZoom) });
+}
+
+// Several fields rendered below (sensor_type keys, fusion_reason,
+// incident.reason, callsigns, names) can originate from client-supplied
+// data the backend only partially constrains -- escape before ever
+// interpolating into innerHTML, rather than trusting each render site to
+// remember to.
+const HTML_ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, (c) => HTML_ESCAPE_MAP[c]);
+}
+
+// Detection.metadata / Track.evidence / Incident.evidence (server-side:
+// see the comments on those fields in models.hpp) are arbitrary
+// client-supplied JSON -- decoded Remote ID Self-ID descriptions,
+// serials, and operator IDs are free text broadcast by the drone itself,
+// exactly as attacker-controlled as the sensor_type field that was this
+// project's confirmed XSS vector. Nothing renders these yet, but when a
+// panel does, run the value through this first rather than escapeHtml()
+// directly -- it walks nested objects/arrays and escapes every string
+// leaf, so a future `<div>${escapeHtmlDeep(evidence)}</div>`-style render
+// doesn't need its own recursion to be safe.
+function escapeHtmlDeep(value) {
+  if (typeof value === 'string') return escapeHtml(value);
+  if (Array.isArray(value)) return value.map(escapeHtmlDeep);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[escapeHtml(k)] = escapeHtmlDeep(v);
+    return out;
+  }
+  return value; // numbers, booleans, null pass through unchanged
+}
+
+// ==================== Bottom panels ====================
+function renderBottomPanels() {
+  const search = document.getElementById('search-box').value.toLowerCase();
+  const listTitle = document.getElementById('list-title');
+  const listContent = document.getElementById('list-content');
+  let items = [];
+
+  // Registry search hits backend lookups (FAA registry, type designators)
+  // rather than filtering an already-loaded array like every other mode
+  // here, so it's async and manages its own list/detail rendering instead
+  // of feeding into the items[] pattern the rest of this function uses.
+  if (mode === 'registry') {
+    runRegistrySearch(search.trim());
+    return;
+  }
+
+  if (mode === 'live') {
+    listTitle.textContent = search ? 'Live Tracks & Aircraft' : 'Live Tracks';
+    const trackItems = tracksData
+      .filter(t => !search || String(t.track_id).includes(search) || t.classification.includes(search))
+      .map(t => rowHtml(`Track #${t.track_id}`, `${t.classification.replace('_',' ')} · conf ${t.confidence.toFixed(2)}`,
+        t.classification, () => selectTrack(t.track_id)));
+
+    // Aircraft and airports are only searched (not listed by default) --
+    // with a live feed of hundreds of planes and tens of thousands of
+    // airports worldwide, showing them all here at once would bury the
+    // drone tracks this panel exists for. Type to find and select one.
+    let aircraftItems = [], airportItems = [];
+    if (search) {
+      aircraftItems = aircraftData
+        .filter(a => (a.callsign && a.callsign.toLowerCase().includes(search)) || a.icao24.toLowerCase().includes(search))
+        .slice(0, 30) // cap results so a broad match (e.g. a single letter) doesn't flood the list
+        .map(a => rowHtml(`✈ ${a.callsign || a.icao24}`,
+          `${a.origin_country || 'Unknown origin'} · ${a.on_ground ? 'on ground' : Math.round((a.altitude_m || 0) * 3.281).toLocaleString() + ' ft'}`,
+          '', () => selectAircraft(a.icao24)));
+
+      airportItems = airportsData
+        .filter(a => (a.name && a.name.toLowerCase().includes(search)) || (a.ident && a.ident.toLowerCase().includes(search))
+          || (a.icao_code && a.icao_code.toLowerCase().includes(search)) || (a.iata_code && a.iata_code.toLowerCase().includes(search)))
+        .slice(0, 30)
+        .map(a => rowHtml(`▲ ${a.name || a.ident}`, `${a.municipality || a.iso_country || ''} · ${(a.type || '').replace(/_/g, ' ')}`,
+          '', () => selectAirport(a.ident)));
+    }
+
+    items = trackItems.concat(aircraftItems).concat(airportItems);
+  } else if (mode === 'history') {
+    listTitle.textContent = search ? 'Incidents, Tracks & Aircraft' : 'Incident History';
+    const incidentItems = incidentsData
+      .filter(i => !search || i.reason.toLowerCase().includes(search))
+      .map(i => rowHtml(`Track #${i.track_id} — ${i.classification.replace('_',' ')}`,
+        new Date(i.timestamp * 1000).toLocaleString(), i.classification,
+        () => { selectedId = { type: 'incident', id: i.incident_id, data: i }; renderBottomPanels(); }));
+
+    // Tracks/aircraft from the loaded history window are only searched (not
+    // listed by default), same rationale as the live-mode aircraft/airport
+    // search below -- historyWindow.aircraft alone is routinely thousands
+    // of points, so showing it all here at once would bury the incident
+    // list this panel exists for. Type a callsign/ICAO24/track id to find one.
+    let historyTrackItems = [], historyAircraftItems = [];
+    if (search && historyWindow) {
+      historyTrackItems = historyWindow.tracks
+        .filter(t => String(t.track_id).includes(search) || (t.classification || '').toLowerCase().includes(search))
+        .slice(0, 30)
+        .map(t => rowHtml(`Track #${t.track_id}`, (t.classification || 'unknown').replace('_', ' '), t.classification,
+          () => selectHistoryTrack(t.track_id)));
+
+      historyAircraftItems = historyWindow.aircraft
+        .filter(a => (a.callsign && a.callsign.toLowerCase().includes(search)) || a.icao24.toLowerCase().includes(search))
+        .slice(0, 30)
+        .map(a => rowHtml(`✈ ${(a.callsign && a.callsign.trim()) || a.icao24}`, a.icao24, '',
+          () => selectHistoryAircraft(a.icao24)));
+    }
+
+    items = incidentItems.concat(historyTrackItems).concat(historyAircraftItems);
+  } else if (mode === 'alerts') {
+    listTitle.textContent = 'Active Alerts';
+    items = incidentsData
+      .filter(i => !search || i.reason.toLowerCase().includes(search))
+      .map(i => rowHtml(`${i.incident_type === 'geofence_violation' ? '⚠ Zone entry' : 'Classification'} — Track #${i.track_id}`,
+        i.reason, i.classification,
+        () => { selectedId = { type: 'incident', id: i.incident_id, data: i }; renderBottomPanels(); }));
+  } else if (mode === 'zones') {
+    listTitle.textContent = 'Restricted Zones';
+    const allZones = [
+      ...zonesData.map(z => ({ name: z.name, source: 'local', kind: 'no_fly' })),
+      ...(airspaceData.faa_uas_facility_map || []).map(a => ({ name: a.name, source: 'FAA', kind: 'altitude_ceiling' })),
+      ...(airspaceData.faa_national_security_restrictions || []).map(a => ({ name: a.name, source: 'FAA', kind: 'no_fly' })),
+      ...(airspaceData.faa_tfr || []).map(a => ({ name: a.name, source: 'FAA TFR', kind: 'no_fly' })),
+      ...(airspaceData.openaip_restrictions || []).map(a => ({ name: a.name, source: 'OpenAIP', kind: 'no_fly' })),
+    ];
+    items = allZones
+      .filter(z => !search || z.name.toLowerCase().includes(search))
+      .map(z => rowHtml(z.name, `${z.source} · ${z.kind === 'no_fly' ? 'No-fly' : 'Altitude ceiling'}`,
+        z.kind === 'no_fly' ? 'high' : '', () => selectZone(z.name)));
+  } else if (mode === 'settings') {
+    listTitle.textContent = 'Data Sources';
+    items = [
+      rowHtml('Live aircraft feed', 'OpenSky, global positions + category · free tier', '', () => {}),
+      rowHtml('FAA Airspace (ArcGIS)', 'UAS Facility Map + Security Restrictions', '', () => {}),
+      rowHtml('Worldwide airports (OurAirports)', `${airportsData.length.toLocaleString()} facilities · refreshed weekly`, '', () => {}),
+      rowHtml('OpenAIP', 'Requires OPENAIP_API_KEY env var', '', () => {}),
+    ];
+  }
+
+  document.getElementById('list-count').textContent = items.length;
+  listContent.innerHTML = items.join('') || '<div id="detail-empty">Nothing here yet.</div>';
+
+  renderDetail();
+}
+
+function rowHtml(title, sub, cls, onclick) {
+  const id = 'row_' + Math.random().toString(36).slice(2);
+  setTimeout(() => { const el = document.getElementById(id); if (el) el.onclick = onclick; }, 0);
+  return `<div class="list-row ${cls}" id="${id}"><div class="row-top"><span>${escapeHtml(title)}</span></div><div class="row-sub">${escapeHtml(sub)}</div></div>`;
+}
+
+function renderDetail() {
+  const title = document.getElementById('detail-title');
+  const content = document.getElementById('detail-content');
+
+  // Only an airport selection draws a runway outline / perimeter -- clear
+  // both whenever anything else (or nothing) is selected, otherwise a
+  // stale outline would linger on the map after selecting something
+  // unrelated.
+  if (!selectedId || selectedId.type !== 'airport') {
+    if (map.getSource('airport-outline')) map.getSource('airport-outline').setData(emptyFC());
+    if (map.getSource('airport-perimeter')) map.getSource('airport-perimeter').setData(emptyFC());
+    airportPerimeterSeq++; // invalidate any in-flight perimeter fetch for the airport just left
+  }
+
+  if (!selectedId) {
+    title.textContent = 'Selection';
+    content.innerHTML = '<div id="detail-empty">Select an item on the left, or click something on the map.</div>';
+    updateSelectionRing();
+    return;
+  }
+
+  if (selectedId.type === 'track') {
+    const t = tracksData.find(x => x.track_id === selectedId.id);
+    if (!t) { content.innerHTML = '<div id="detail-empty">Track no longer active.</div>'; return; }
+    title.textContent = `Track #${t.track_id}`;
+    const sensors = Object.entries(t.sensor_hit_counts || {}).map(([s,n]) => `<span class="badge">${escapeHtml(s)}: ${n}</span>`).join('');
+    content.innerHTML = `
+      <div class="section-card">
+        <div class="kv">
+          <div>Classification</div><div>${escapeHtml(t.classification.replace('_',' '))}</div>
+          <div>Confidence</div><div>${t.confidence.toFixed(2)}</div>
+          <div>Status</div><div>${escapeHtml(t.status)}</div>
+          <div>Detections</div><div>${t.detection_count}</div>
+        </div>
+        <div>${sensors}</div>
+      </div>
+      <div class="section-card">${escapeHtml(t.fusion_reason)}</div>
+    `;
+    flyToOnce('track', t.track_id, t.lon, t.lat, 12);
+  } else if (selectedId.type === 'aircraft') {
+    const a = aircraftData.find(x => x.icao24 === selectedId.id);
+    if (!a) { content.innerHTML = '<div id="detail-empty">Aircraft out of range or lost from the feed.</div>'; return; }
+    title.textContent = a.callsign || a.icao24;
+
+    const vr = a.vertical_rate_mps;
+    let trend = 'Level';
+    if (vr != null) {
+      if (vr > 0.5) trend = `Climbing · ${Math.round(vr * 196.85)} ft/min`;
+      else if (vr < -0.5) trend = `Descending · ${Math.round(Math.abs(vr) * 196.85)} ft/min`;
+    }
+    const status = a.on_ground ? 'On ground' : 'Airborne';
+    const geo_ft = a.geo_altitude_m != null ? Math.round(a.geo_altitude_m * 3.281) : null;
+    const baro_ft = a.baro_altitude_m != null ? Math.round(a.baro_altitude_m * 3.281) : null;
+    const spd_kt = a.velocity_mps != null ? Math.round(a.velocity_mps * 1.944) : null;
+    const spd_mph = a.velocity_mps != null ? Math.round(a.velocity_mps * 2.237) : null;
+    const catLabel = (a.category_name || 'unknown').replace(/_/g, ' ');
+    const emergencySquawk = { '7500': 'Hijack', '7600': 'Radio failure', '7700': 'Emergency' };
+    const squawkNote = a.squawk && emergencySquawk[a.squawk] ? ` (${emergencySquawk[a.squawk]})` : '';
+    const posSourceNames = ['ADS-B', 'ASTERIX', 'MLAT', 'FLARM'];
+    const posSource = a.position_source != null ? (posSourceNames[a.position_source] || `code ${a.position_source}`) : '—';
+    const freshnessS = a.last_contact ? Math.max(0, Math.round(Date.now() / 1000 - a.last_contact)) : null;
+
+    content.innerHTML = `
+      <div class="section-card">
+        <div class="kv">
+          <div>Status</div><div>${status}</div>
+          <div>ICAO24</div><div>${escapeHtml(a.icao24)}</div>
+          <div>Callsign</div><div>${escapeHtml(a.callsign) || '—'}</div>
+          <div>Origin</div><div>${escapeHtml(a.origin_country) || '—'}</div>
+          <div>Category</div><div>${catLabel}${a.category_known ? '' : ' (unreported)'}</div>
+        </div>
+      </div>
+      <div class="section-card">
+        <div class="kv">
+          <div>Geo altitude</div><div>${geo_ft != null ? geo_ft.toLocaleString() + ' ft' : '—'}</div>
+          <div>Baro altitude</div><div>${baro_ft != null ? baro_ft.toLocaleString() + ' ft' : '—'}</div>
+          <div>Ground speed</div><div>${spd_kt != null ? spd_kt + ' kt (' + spd_mph + ' mph)' : '—'}</div>
+          <div>Heading</div><div>${a.heading_deg != null ? Math.round(a.heading_deg) + '°' : '—'}</div>
+          <div>Vertical</div><div>${trend}</div>
+        </div>
+      </div>
+      <div class="section-card">
+        <div class="kv">
+          <div>Squawk</div><div>${a.squawk || '—'}${squawkNote}</div>
+          <div>SPI</div><div>${a.spi ? 'Yes (special position ident)' : 'No'}</div>
+          <div>Position source</div><div>${posSource}</div>
+          <div>Position</div><div>${a.lat.toFixed(4)}, ${a.lon.toFixed(4)}</div>
+          <div>Last contact</div><div>${freshnessS != null ? freshnessS + 's ago' : '—'}</div>
+        </div>
+      </div>`;
+    flyToOnce('aircraft', a.icao24, a.lon, a.lat, 8);
+  } else if (selectedId.type === 'airport') {
+    const ap = airportsData.find(x => x.ident === selectedId.id);
+    if (!ap) { content.innerHTML = '<div id="detail-empty">Airport not in the current directory.</div>'; return; }
+    title.textContent = ap.name || ap.ident;
+    const runwayCount = renderAirportOutline(ap.ident);
+    renderAirportPerimeter(ap);
+    const runwaysHere = runwaysData.filter(r => r.airport_ident === ap.ident);
+    const runwayRows = runwaysHere.map(r =>
+      `<div>${escapeHtml(r.le_ident)}/${escapeHtml(r.he_ident)}</div><div>${r.length_ft ? Math.round(r.length_ft).toLocaleString() + ' × ' : ''}${r.width_ft ? Math.round(r.width_ft) + ' ft' : '—'}${r.surface ? ' · ' + escapeHtml(r.surface) : ''}</div>`
+    ).join('');
+    content.innerHTML = `
+      <div class="section-card">
+        <div class="kv">
+          <div>Ident</div><div>${ap.ident || '—'}</div>
+          <div>ICAO</div><div>${ap.icao_code || '—'}</div>
+          <div>IATA</div><div>${ap.iata_code || '—'}</div>
+          <div>Type</div><div>${(ap.type || '').replace(/_/g, ' ')}</div>
+        </div>
+      </div>
+      <div class="section-card">
+        <div class="kv">
+          <div>Municipality</div><div>${ap.municipality || '—'}</div>
+          <div>Region</div><div>${ap.iso_region || '—'}</div>
+          <div>Country</div><div>${ap.iso_country || '—'}</div>
+          <div>Elevation</div><div>${ap.elevation_ft != null ? ap.elevation_ft.toLocaleString() + ' ft' : '—'}</div>
+          <div>Scheduled service</div><div>${ap.scheduled_service ? 'Yes' : 'No'}</div>
+          <div>Position</div><div>${ap.lat.toFixed(4)}, ${ap.lon.toFixed(4)}</div>
+        </div>
+      </div>
+      <div class="section-card">
+        <div style="margin-bottom:6px;">Runways${runwayCount ? ` (${runwayCount}, outlined on map)` : ''}</div>
+        ${runwayCount ? `<div class="kv">${runwayRows}</div>` :
+          '<div style="opacity:.6;font-size:.85em;">No runway geometry on file for this airport (common for small/unpaved airstrips) -- showing its point location only.</div>'}
+      </div>`;
+    flyToOnce('airport', ap.ident, ap.lon, ap.lat, 10);
+  } else if (selectedId.type === 'incident') {
+    const i = selectedId.data;
+    title.textContent = `${i.incident_type === 'geofence_violation' ? 'Zone Entry' : 'Classification'} Alert`;
+    content.innerHTML = `
+      <div class="section-card">
+        <div class="kv">
+          <div>Track</div><div>#${i.track_id}</div>
+          <div>Classification</div><div>${escapeHtml(i.classification.replace('_',' '))}</div>
+          <div>Confidence</div><div>${i.confidence.toFixed(2)}</div>
+          <div>Time</div><div>${new Date(i.timestamp * 1000).toLocaleString()}</div>
+        </div>
+        <div>${escapeHtml(i.reason)}</div>
+      </div>`;
+    flyToOnce('incident', i.incident_id, i.lon, i.lat, 12);
+  } else if (selectedId.type === 'zone') {
+    title.textContent = selectedId.id;
+    content.innerHTML = `<div class="section-card">Restricted area — see map for extent.</div>`;
+  } else if (selectedId.type === 'history-track') {
+    const t = selectedId.data;
+    const visible = inOwnRange(t.points, historyScrubMs);
+    const pos = visible ? interpolateAtTime(t.points, historyScrubMs) : null;
+    title.textContent = `Track #${t.track_id} (historical)`;
+    const alt_ft = pos && pos.alt_m != null ? Math.round(pos.alt_m * 3.281) : null;
+    content.innerHTML = `
+      <div class="section-card">
+        <div class="kv">
+          <div>Classification</div><div>${escapeHtml((t.classification || 'unknown').replace('_', ' '))}</div>
+          <div>Position</div><div>${pos ? pos.lat.toFixed(4) + ', ' + pos.lon.toFixed(4) : '—'}</div>
+          <div>Altitude</div><div>${alt_ft != null ? alt_ft.toLocaleString() + ' ft' : '—'}</div>
+          <div>Time</div><div>${pos ? new Date(pos.timestamp * 1000).toLocaleString() : '—'}</div>
+        </div>
+        <div style="opacity:.6;font-size:.85em;margin-top:6px;">${visible
+          ? 'Historical position at scrubber time — reconstructed from the detections log, not live telemetry.'
+          : 'Not tracked at the current scrubber time (outside this track’s observed window).'}</div>
+      </div>`;
+    if (pos) flyToOnce('history-track', t.track_id, pos.lon, pos.lat, 12);
+  } else if (selectedId.type === 'history-aircraft') {
+    const a = selectedId.data;
+    const visible = inOwnRange(a.points, historyScrubMs);
+    const pos = visible ? interpolateAtTime(a.points, historyScrubMs) : null;
+    const callsign = a.callsign ? a.callsign.trim() : '';
+    title.textContent = callsign || a.icao24;
+    const alt_ft = pos && pos.alt_m != null ? Math.round(pos.alt_m * 3.281) : null;
+    content.innerHTML = `
+      <div class="section-card">
+        <div class="kv">
+          <div>ICAO24</div><div>${escapeHtml(a.icao24)}</div>
+          <div>Callsign</div><div>${callsign ? escapeHtml(callsign) : '—'}</div>
+          <div>Altitude</div><div>${alt_ft != null ? alt_ft.toLocaleString() + ' ft' : '—'}</div>
+          <div>Position</div><div>${pos ? pos.lat.toFixed(4) + ', ' + pos.lon.toFixed(4) : '—'}</div>
+          <div>Time</div><div>${pos ? new Date(pos.timestamp * 1000).toLocaleString() : '—'}</div>
+        </div>
+        <div style="opacity:.6;font-size:.85em;margin-top:6px;">${visible
+          ? 'Historical position at scrubber time, interpolated between logged snapshots — not live telemetry.'
+          : 'Not in coverage at the current scrubber time (before its first sighting or after its last).'}</div>
+      </div>`;
+    if (pos) flyToOnce('history-aircraft', a.icao24, pos.lon, pos.lat, 8);
+  } else if (selectedId.type === 'registry-aircraft') {
+    const r = selectedId.data;
+    const fr = r.faa_registry;
+    title.textContent = fr.n_number;
+    content.innerHTML = `
+      <div class="section-card">
+        <div class="kv">
+          <div>N-Number</div><div>${escapeHtml(fr.n_number)}</div>
+          <div>ICAO24</div><div>${fr.icao24 ? escapeHtml(fr.icao24) : '—'}</div>
+          <div>Manufacturer</div><div>${escapeHtml(fr.manufacturer) || '—'}</div>
+          <div>Model</div><div>${escapeHtml(fr.model) || '—'}</div>
+          <div>Type</div><div>${escapeHtml((fr.type_aircraft || 'unknown').replace(/_/g, ' '))}${fr.is_helicopter ? ' (helicopter)' : ''}</div>
+          <div>Year built</div><div>${fr.year_mfr ? escapeHtml(fr.year_mfr) : '—'}</div>
+        </div>
+      </div>
+      <div class="section-card">
+        <div class="kv">
+          <div>Registrant</div><div>${escapeHtml(fr.registrant_name) || '—'}</div>
+          <div>Location</div><div>${escapeHtml(fr.city) || '?'}, ${escapeHtml(fr.state) || '?'}</div>
+          <div>Status code</div><div>${escapeHtml(fr.status_code) || '—'}</div>
+          <div>Country (Mode S block)</div><div>${r.icao_allocation_country_guess ? escapeHtml(r.icao_allocation_country_guess) : '—'}</div>
+        </div>
+        <div style="opacity:.6;font-size:.85em;margin-top:6px;">FAA Releasable Aircraft Registry -- US N-number registrations only, refreshed weekly. Country is a best-effort guess from the icao24 Mode S allocation block, not authoritative.</div>
+      </div>`;
+  } else if (selectedId.type === 'registry-type') {
+    const r = selectedId.data;
+    title.textContent = `${selectedId.id} — ${r.manufacturer}`;
+    content.innerHTML = `
+      <div class="section-card">
+        <div class="kv">
+          <div>Type code</div><div>${escapeHtml(selectedId.id)}</div>
+          <div>Manufacturer</div><div>${escapeHtml(r.manufacturer)}</div>
+          <div>Model</div><div>${escapeHtml(r.model)}</div>
+          <div>Category</div><div>${r.is_helicopter ? 'Helicopter' : 'Fixed-wing'}</div>
+        </div>
+        <div style="opacity:.6;font-size:.85em;margin-top:6px;">Curated subset of common ICAO type designators -- not the full DOC 8643 table.</div>
+      </div>`;
+  }
+
+  updateSelectionRing();
+}
+
+// ==================== Clock ====================
+function updateClock() {
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString([], { hour12: false });
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+if (window.lucide) lucide.createIcons();
+</script>
+</body>
+</html>
